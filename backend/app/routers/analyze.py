@@ -192,7 +192,7 @@ async def analyze(body: AnalyzeRequest, request: Request) -> AnalyzeResponse | J
             headers={"X-RateLimit-Remaining": "0"},
         )
 
-    logger.info("Analyze request from %s, text length: %d", client_ip, len(body.text))
+    logger.info("Analyze request, text length: %d", len(body.text))
 
     language = detect_language(body.text)
     metrics = analyze_text(body.text, language)
@@ -257,7 +257,11 @@ async def humanize_endpoint(body: HumanizeRequest, request: Request) -> Humanize
 
     language = detect_language(body.text)
 
-    result, llm_available = await humanize_text(body.text, language)
+    try:
+        result, llm_available = await humanize_text(body.text, language)
+    except Exception as e:
+        logger.error("Humanize failed unexpectedly: %s", type(e).__name__)
+        result, llm_available = None, False
 
     if not llm_available or result is None:
         lang = language if language in ("it", "en", "es") else "en"

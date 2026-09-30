@@ -97,6 +97,41 @@ def _parse_json_response(content: str) -> list[dict]:
     return validated
 
 
+async def _call_model(model: str, messages: list[dict], headers: dict) -> tuple[list[dict], str | None]:
+    """One attempt on one model. Returns (suggestions, None) on success, ([], error_type) otherwise."""
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": 4000,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            response = await client.post(OPENROUTER_URL, json=payload, headers=headers)
+    except httpx.TimeoutException:
+        return [], "timeout"
+    except httpx.HTTPError as e:
+        return [], f"network_{type(e).__name__}"
+
+    if response.status_code != 200:
+        return [], f"http_{response.status_code}"
+
+    try:
+        content = response.json()["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        return [], "malformed"
+    if not isinstance(content, str) or not content.strip():
+        return [], "empty"
+
+    try:
+        suggestions = _parse_json_response(content)
+    except (ValueError, TypeError):
+        return [], "malformed"
+    if not suggestions:
+        return [], "empty"
+    return suggestions, None
+
+
 async def get_llm_suggestions(
     text: str,
     language: str,
@@ -117,6 +152,10 @@ async def get_llm_suggestions(
         repetition_score=metrics.get("repetition_score", 50),
         language_name=language_name,
     )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -125,53 +164,24 @@ async def get_llm_suggestions(
         "X-Title": "RealText",
     }
 
-    for model in FREE_MODELS:
+    errors: list[str] = []
+    for i, model in enumerate(FREE_MODELS):
         try:
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.7,
-                "max_tokens": 4000,
-            }
-            async with httpx.AsyncClient(timeout=25.0) as client:
-                response = await client.post(
-                    OPENROUTER_URL, json=payload, headers=headers
-                )
-
-            if response.status_code == 429:
-                logger.warning("Rate limited on model %s", model)
-                continue
-
-            if response.status_code >= 500:
-                logger.warning("Server error %d on model %s", response.status_code, model)
-                continue
-
-            if response.status_code != 200:
-                logger.warning(
-                    "Unexpected status %d on model %s: %s",
-                    response.status_code, model, response.text[:200],
-                )
-                continue
-
-            data = response.json()
-            content = data["choices"][0]["message"]["content"]
-            suggestions = _parse_json_response(content)
-
-            if suggestions:
-                logger.info("Got %d suggestions from %s", len(suggestions), model)
-                return suggestions, True
-
-            logger.warning("Empty suggestions from %s", model)
-
-        except httpx.TimeoutException:
-            logger.warning("Timeout on model %s", model)
-        except (json.JSONDecodeError, KeyError, IndexError) as e:
-            logger.warning("Parse error on model %s: %s", model, e)
+            suggestions, error = await _call_model(model, messages, headers)
         except Exception as e:
-            logger.warning("Unexpected error on model %s: %s", model, e)
+            suggestions, error = [], f"error_{type(e).__name__}"
 
-    logger.warning("All LLM models failed, returning empty suggestions")
+        if suggestions:
+            logger.info(
+                "llm_request endpoint=advisor model=%s attempts=%d errors=%s",
+                model, i + 1, ",".join(errors) or "-",
+            )
+            return suggestions, True
+
+        errors.append(f"{model}:{error}")
+
+    logger.warning(
+        "llm_request endpoint=advisor model=none attempts=%d errors=%s",
+        len(FREE_MODELS), ",".join(errors) or "-",
+    )
     return [], False

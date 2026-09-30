@@ -93,6 +93,40 @@ def _parse_response(content: str) -> dict | None:
     return None
 
 
+async def _call_model(model: str, messages: list[dict], headers: dict) -> tuple[dict | None, str | None]:
+    """One attempt on one model. Returns (result, None) on success, (None, error_type) otherwise."""
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.8,
+        "max_tokens": 4096,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            response = await client.post(OPENROUTER_URL, json=payload, headers=headers)
+    except httpx.TimeoutException:
+        return None, "timeout"
+    except httpx.HTTPError as e:
+        return None, f"network_{type(e).__name__}"
+
+    if response.status_code != 200:
+        return None, f"http_{response.status_code}"
+
+    try:
+        content = response.json()["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        return None, "malformed"
+    if not isinstance(content, str) or not content.strip():
+        return None, "empty"
+
+    parsed = _parse_response(content)
+    if not parsed:
+        return None, "malformed"
+    if not parsed["humanized_text"].strip():
+        return None, "empty"
+    return parsed, None
+
+
 async def humanize_text(text: str, language: str) -> tuple[dict | None, bool]:
     api_key = os.getenv("OPENROUTER_API_KEY", "")
     if not api_key or api_key == "sk-or-v1-your-key-here":
@@ -102,6 +136,10 @@ async def humanize_text(text: str, language: str) -> tuple[dict | None, bool]:
     language_name = LANGUAGE_NAMES.get(language, "English")
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(language_name=language_name)
     user_prompt = USER_PROMPT_TEMPLATE.format(text=text[:5000], language_name=language_name)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -110,47 +148,26 @@ async def humanize_text(text: str, language: str) -> tuple[dict | None, bool]:
         "X-Title": "RealText",
     }
 
-    for model in FREE_MODELS:
+    errors: list[str] = []
+    for i, model in enumerate(FREE_MODELS):
         try:
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.8,
-                "max_tokens": 4096,
-            }
-            async with httpx.AsyncClient(timeout=45.0) as client:
-                response = await client.post(OPENROUTER_URL, json=payload, headers=headers)
-
-            if response.status_code == 429:
-                logger.warning("Rate limited on model %s, waiting 3s", model)
-                await asyncio.sleep(3)
-                continue
-
-            if response.status_code in (500, 502, 503):
-                logger.warning("Error %d on model %s", response.status_code, model)
-                continue
-
-            if response.status_code != 200:
-                logger.warning("Status %d on model %s", response.status_code, model)
-                continue
-
-            data = response.json()
-            content = data["choices"][0]["message"]["content"]
-            logger.debug("Raw response from %s: %s", model, content[:500])
-            parsed = _parse_response(content)
-
-            if parsed:
-                logger.info("Humanized with model %s", model)
-                return parsed, True
-
-            logger.warning("Failed to parse response from %s. Raw content: %s", model, content[:1000])
-
-        except httpx.TimeoutException:
-            logger.warning("Timeout on model %s", model)
+            result, error = await _call_model(model, messages, headers)
         except Exception as e:
-            logger.warning("Error on model %s: %s", model, e)
+            result, error = None, f"error_{type(e).__name__}"
 
+        if result:
+            logger.info(
+                "llm_request endpoint=humanize model=%s attempts=%d errors=%s",
+                model, i + 1, ",".join(errors) or "-",
+            )
+            return result, True
+
+        errors.append(f"{model}:{error}")
+        if error == "http_429" and i < len(FREE_MODELS) - 1:
+            await asyncio.sleep(3)
+
+    logger.warning(
+        "llm_request endpoint=humanize model=none attempts=%d errors=%s",
+        len(FREE_MODELS), ",".join(errors) or "-",
+    )
     return None, False
