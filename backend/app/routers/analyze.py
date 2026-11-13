@@ -1,4 +1,5 @@
 import logging
+from datetime import date
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -11,7 +12,7 @@ from app.services.language_detector import detect_language
 from app.services.text_analyzer import analyze_text
 from app.services.llm_advisor import get_llm_suggestions
 from app.services.llm_humanizer import humanize_text
-from app.services.rate_limiter import check_rate_limit
+from app.services.rate_limiter import check_rate_limit, refund_rate_limit
 from app.db.database import log_analysis
 
 logger = logging.getLogger(__name__)
@@ -246,8 +247,10 @@ HUMANIZE_FALLBACK: dict[str, dict[str, str]] = {
 @router.post("/humanize", response_model=HumanizeResponse)
 async def humanize_endpoint(body: HumanizeRequest, request: Request) -> HumanizeResponse | JSONResponse:
     client_ip = _get_client_ip(request)
+    # Same day for charge and (possible) refund, even if the LLM chain runs across midnight.
+    quota_day = date.today().isoformat()
 
-    allowed, remaining = await check_rate_limit(client_ip)
+    allowed, remaining = await check_rate_limit(client_ip, day=quota_day)
     if not allowed:
         return JSONResponse(
             status_code=429,
@@ -264,6 +267,11 @@ async def humanize_endpoint(body: HumanizeRequest, request: Request) -> Humanize
         result, llm_available = None, False
 
     if not llm_available or result is None:
+        # Nothing was produced: give the use back so a provider outage does not cost the user.
+        try:
+            remaining = await refund_rate_limit(client_ip, day=quota_day)
+        except Exception as e:
+            logger.error("Rate limit refund failed: %s", type(e).__name__)
         lang = language if language in ("it", "en", "es") else "en"
         return JSONResponse(
             status_code=503,

@@ -3,6 +3,7 @@ import os
 import json
 import re
 import logging
+import time
 
 import httpx
 
@@ -10,9 +11,39 @@ logger = logging.getLogger(__name__)
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-FREE_MODELS = [
-    "nvidia/nemotron-3-super-120b-a12b:free",
+# Fallback chain, tried in order until one succeeds. Override with HUMANIZE_MODELS
+# (comma-separated) without touching the code when OpenRouter retires a model.
+DEFAULT_MODELS = [
+    "google/gemma-4-31b-it:free",
+    "nvidia/nemotron-3.5-lightning:free",
+    "google/gemma-4-26b-a4b-it:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
 ]
+
+# Time budget. The lowest timeout on the request path is 45s (frontend AbortController for
+# /api/humanize and the previous httpx timeout); nginx proxy_read_timeout is 120s.
+# The whole chain must finish at least 10s before the lowest one, so: 45 - 10 = 35s.
+TOTAL_BUDGET_SECONDS = 35.0
+# A single model never gets more than this, so a slow model still leaves room for a fallback.
+PER_MODEL_TIMEOUT_SECONDS = 25.0
+# Do not start an attempt with less time than this left: it could not finish anyway.
+MIN_ATTEMPT_SECONDS = 3.0
+# Short pause after a 429 before moving to the next model (bounded by the remaining budget).
+RATE_LIMIT_BACKOFF_SECONDS = 3.0
+
+# Errors that mean "this model will not work for this request": skip to the next one at once.
+SKIP_IMMEDIATELY = {"http_404", "http_400"}
+
+
+def get_models() -> list[str]:
+    """Model chain from HUMANIZE_MODELS (comma-separated), or the default chain."""
+    raw = os.getenv("HUMANIZE_MODELS", "")
+    models: list[str] = []
+    for item in raw.split(","):
+        model = item.strip()
+        if model and model not in models:
+            models.append(model)
+    return models or list(DEFAULT_MODELS)
 
 LANGUAGE_NAMES: dict[str, str] = {
     "it": "Italian",
@@ -93,8 +124,19 @@ def _parse_response(content: str) -> dict | None:
     return None
 
 
-async def _call_model(model: str, messages: list[dict], headers: dict) -> tuple[dict | None, str | None]:
-    """One attempt on one model. Returns (result, None) on success, (None, error_type) otherwise."""
+async def _post(payload: dict, headers: dict, timeout: float) -> httpx.Response:
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        return await client.post(OPENROUTER_URL, json=payload, headers=headers)
+
+
+async def _call_model(
+    model: str, messages: list[dict], headers: dict, timeout: float = PER_MODEL_TIMEOUT_SECONDS
+) -> tuple[dict | None, str | None]:
+    """One attempt on one model. Returns (result, None) on success, (None, error_type) otherwise.
+
+    `timeout` caps the whole attempt: httpx timeouts apply per operation (connect, each read),
+    so the request is also wrapped in asyncio.wait_for to enforce a hard wall-clock limit.
+    """
     payload = {
         "model": model,
         "messages": messages,
@@ -102,9 +144,8 @@ async def _call_model(model: str, messages: list[dict], headers: dict) -> tuple[
         "max_tokens": 4096,
     }
     try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            response = await client.post(OPENROUTER_URL, json=payload, headers=headers)
-    except httpx.TimeoutException:
+        response = await asyncio.wait_for(_post(payload, headers, timeout), timeout=timeout)
+    except (asyncio.TimeoutError, httpx.TimeoutException):
         return None, "timeout"
     except httpx.HTTPError as e:
         return None, f"network_{type(e).__name__}"
@@ -148,26 +189,41 @@ async def humanize_text(text: str, language: str) -> tuple[dict | None, bool]:
         "X-Title": "RealText",
     }
 
+    models = get_models()
+    deadline = time.monotonic() + TOTAL_BUDGET_SECONDS
     errors: list[str] = []
-    for i, model in enumerate(FREE_MODELS):
+    attempts = 0
+
+    for i, model in enumerate(models):
+        remaining = deadline - time.monotonic()
+        if remaining < MIN_ATTEMPT_SECONDS:
+            break  # budget exhausted: the remaining models are not tried
+
+        attempts += 1
         try:
-            result, error = await _call_model(model, messages, headers)
+            result, error = await _call_model(
+                model, messages, headers, timeout=min(PER_MODEL_TIMEOUT_SECONDS, remaining)
+            )
         except Exception as e:
             result, error = None, f"error_{type(e).__name__}"
 
         if result:
             logger.info(
                 "llm_request endpoint=humanize model=%s attempts=%d errors=%s",
-                model, i + 1, ",".join(errors) or "-",
+                model, attempts, ",".join(errors) or "-",
             )
             return result, True
 
         errors.append(f"{model}:{error}")
-        if error == "http_429" and i < len(FREE_MODELS) - 1:
-            await asyncio.sleep(3)
+        if error in SKIP_IMMEDIATELY:
+            continue  # model gone or request rejected: no retry, next model right away
+        if error == "http_429" and i < len(models) - 1:
+            pause = min(RATE_LIMIT_BACKOFF_SECONDS, deadline - time.monotonic() - MIN_ATTEMPT_SECONDS)
+            if pause > 0:
+                await asyncio.sleep(pause)
 
     logger.warning(
         "llm_request endpoint=humanize model=none attempts=%d errors=%s",
-        len(FREE_MODELS), ",".join(errors) or "-",
+        attempts, ",".join(errors) or "-",
     )
     return None, False
